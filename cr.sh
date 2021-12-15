@@ -50,37 +50,33 @@ main() {
     repo_root=$(git rev-parse --show-toplevel)
     pushd "$repo_root" > /dev/null
 
-    echo 'Looking up latest tag...'
-    local latest_tag
-    latest_tag=$(lookup_latest_tag)
+    rm -rf .cr-release-packages
+    rm -rf .cr-index
 
-    echo "Discovering changed charts since '$latest_tag'..."
-    local changed_charts=()
-    readarray -t changed_charts <<< "$(lookup_changed_charts "$latest_tag")"
+    echo 'Looking up charts...'
 
-    if [[ -n "${changed_charts[*]}" ]]; then
-        install_chart_releaser
+    find "$charts_dir" -name "Chart.yaml" | while read chart_yaml
+    do
+        chart_name="$(cat "${chart_yaml}" | grep -E '^name:' | sed -e 's#^name:[[:space:]]*##' -e 's#[[:space:]]*$##')"
+        echo "Looking up ${chart_name}* latest tag..."
+        local latest_tag
+        latest_tag="$(lookup_latest_tag "$chart_name")"
+        echo "Discovering changed charts since '$latest_tag'..."
 
-        rm -rf .cr-release-packages
-        mkdir -p .cr-release-packages
+        chart_folder="$(dirname "$chart_yaml")"
 
-        rm -rf .cr-index
-        mkdir -p .cr-index
+        if lookup_chart_change "$latest_tag" "$chart_folder"; then
+            install_chart_releaser
+            package_chart "$chart_folder"
+        else
+            echo "Nothing to do. No chart changes detected."
+        fi
 
-        for chart in "${changed_charts[@]}"; do
-            if [[ -d "$chart" ]]; then
-                package_chart "$chart"
-            else
-                echo "Chart '$chart' no longer exists in repo. Skipping it..."
-            fi
-        done
-
-        release_charts
-        update_index
-    else
-        echo "Nothing to do. No chart changes detected."
-    fi
-
+    done
+        
+    test -d '.cr-release-packages' && release_charts
+    test -d '.cr-index' && update_index
+    
     popd > /dev/null
 }
 
@@ -176,16 +172,19 @@ parse_command_line() {
     fi
 }
 
+cr_path() {
+    local arch
+    arch=$(uname -m)
+    echo "$RUNNER_TOOL_CACHE/ct/$version/$arch"
+}
+
 install_chart_releaser() {
     if [[ ! -d "$RUNNER_TOOL_CACHE" ]]; then
         echo "Cache directory '$RUNNER_TOOL_CACHE' does not exist" >&2
         exit 1
     fi
 
-    local arch
-    arch=$(uname -m)
-
-    local cache_dir="$RUNNER_TOOL_CACHE/ct/$version/$arch"
+    cache_dir="$(cr_path)"
     if [[ ! -d "$cache_dir" ]]; then
         mkdir -p "$cache_dir"
 
@@ -193,46 +192,30 @@ install_chart_releaser() {
         curl -sSLo cr.tar.gz "https://github.com/helm/chart-releaser/releases/download/$version/chart-releaser_${version#v}_linux_amd64.tar.gz"
         tar -xzf cr.tar.gz -C "$cache_dir"
         rm -f cr.tar.gz
-
-        echo 'Adding cr directory to PATH...'
-        export PATH="$cache_dir:$PATH"
     fi
 }
 
 lookup_latest_tag() {
     git fetch --tags > /dev/null 2>&1
 
-    if ! git describe --tags --abbrev=0 2> /dev/null; then
+    if ! git describe --tags --abbrev=0 --match "${1}*" 2> /dev/null; then
         git rev-list --max-parents=0 --first-parent HEAD
     fi
 }
 
-filter_charts() {
-    while read -r chart; do
-        [[ ! -d "$chart" ]] && continue
-        local file="$chart/Chart.yaml"
-        if [[ -f "$file" ]]; then
-            echo "$chart"
-        else
-           echo "WARNING: $file is missing, assuming that '$chart' is not a Helm chart. Skipping." 1>&2
-        fi
-    done
-}
-
-lookup_changed_charts() {
+lookup_chart_change() {
     local commit="$1"
+    local chart_path="$2"
 
     local changed_files
-    changed_files=$(git diff --find-renames --name-only "$commit" -- "$charts_dir")
-
-    local depth=$(( $(tr "/" "\n" <<< "$charts_dir" | sed '/^\(\.\)*$/d' | wc -l) + 1 ))
-    local fields="1-${depth}"
-
-    cut -d '/' -f "$fields" <<< "$changed_files" | uniq | filter_charts
+    git diff --find-renames --name-only "$commit" -- "$chart_path"
 }
 
 package_chart() {
     local chart="$1"
+
+    mkdir -p .cr-release-packages
+    mkdir -p .cr-index
 
     local args=("$chart" --package-path .cr-release-packages)
     if [[ -n "$config" ]]; then
@@ -240,7 +223,7 @@ package_chart() {
     fi
 
     echo "Packaging chart '$chart'..."
-    cr package "${args[@]}"
+    $(cr_path)/cr package "${args[@]}"
 }
 
 release_charts() {
@@ -250,7 +233,7 @@ release_charts() {
     fi
 
     echo 'Releasing charts...'
-    cr upload "${args[@]}"
+    $(cr_path)/cr upload "${args[@]}"
 }
 
 update_index() {
@@ -260,7 +243,7 @@ update_index() {
     fi
 
     echo 'Updating charts repo index...'
-    cr index "${args[@]}"
+    $(cr_path)/cr index "${args[@]}"
 }
 
 main "$@"
